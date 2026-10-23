@@ -77,6 +77,54 @@ curl -s localhost:8090/v1/chat/completions -H 'Content-Type: application/json' -
 
 `reasoning_effort`: `low`, `medium`, `high`, `xhigh`, `max` (thinking budget per tier: `router/adapd.py --think-caps`).
 
+## Performance
+
+Measured on RTX PRO 6000 (power limit 400 W) + RTX PRO 5000, `scripts/duo.sh apd` defaults unless noted. Wait = request sent to first token; e2e = request sent to last token; decode tok/s = output tokens after the first / their time.
+
+**10 concurrent requests × 256K context** (10 sessions sent at once, ~248K-token prompts, 1024 output tokens each)
+
+| | cold: nothing cached (2.48M prompt tokens) | warm: history cached, +4K new tokens each (253K context) |
+|---|---|---|
+| wait mean / worst | 203 / 339 s | 7.8 / 11.2 s |
+| e2e mean / worst | 219 / 348 s | 24.4 / 27.0 s |
+| e2e tok/s per request mean / worst | 5.7 / 2.9 | 42.1 / 38.0 |
+| decode tok/s per request mean / worst | 70 / 43 | 63 / 49 |
+| aggregate prefill | 7,300 tok/s | |
+| aggregate output, average / peak 5 s | 29 / 127 tok/s | 376 / 629 tok/s |
+| total time | 348 s | 27 s |
+
+**Single request, idle card** (one server per card, nothing cached; two requests per length)
+
+| prompt tokens | wait PRO 6000 (mean / worst) | wait PRO 5000 (mean / worst) |
+|---|---|---|
+| 4K | 0.3 / 0.3 s | 0.4 / 0.4 s |
+| 16K | 1.3 / 1.4 s | 1.6 / 1.7 s |
+| 32K | 2.8 / 2.9 s | 3.5 / 3.6 s |
+| 64K | 6.5 / 6.6 s | 8.1 / 8.1 s |
+| 128K | 16.3 / 16.3 s | 20.2 / 20.2 s |
+| 192K | 29.2 / 29.6 s | 36.6 / 36.9 s |
+| 250K | 46.9 / 48.2 s | 58.6 / 60.3 s |
+
+| single-stream decode (DFlash2 drafter, ~1K output tokens, 12 prompts) | mean | worst | best |
+|---|---|---|---|
+| PRO 6000 | 236 tok/s | 133 tok/s | 314 tok/s |
+| PRO 5000 | 181 tok/s | 108 tok/s | 270 tok/s |
+| wait (short prompt) | 0.05 s | 0.07 s | |
+
+**Agent load: 10 concurrent coding-agent sessions, 15 min** (contexts growing from 15K–223K up to 259K; 3 runs, range)
+
+| | value |
+|---|---|
+| requests per run | 416–465 |
+| wait mean | 3.1–3.6 s |
+| wait p90 | 4.7–5.1 s |
+| wait worst (cold 160K-token session start under load) | 104–122 s |
+| wait mean, follow-up turns | 2.2–2.6 s |
+| turn e2e mean / worst | 15.7–17.4 s / 108–163 s |
+| decode tok/s per stream mean / p10 / worst | 59–66 / 32–35 / 16–17 |
+| aggregate output, run average | 345–378 tok/s |
+| aggregate output, peak 60 s | 509–523 tok/s |
+
 ## Feature flags
 
 Set in the environment of `scripts/serve.sh` (`scripts/duo.sh` sets them per layout).
