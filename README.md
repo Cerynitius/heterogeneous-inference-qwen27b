@@ -126,6 +126,17 @@ curl -s localhost:8090/v1/chat/completions -H 'Content-Type: application/json' -
 
 `reasoning_effort`: `low`, `medium`, `high`, `xhigh`, `max` (thinking budget per tier: `router/adapd.py --think-caps`).
 
+Images and video: OpenAI content parts (`image_url`, `video_url`; data URLs or http(s) links). The router shrinks images above 4,194,304 pixels before forwarding (`ROUTER_ARGS="--img-max-pixels N"`, `0` = off).
+
+```bash
+curl -s localhost:8090/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "qwen3.8-27b",
+  "messages": [{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+    {"type": "text", "text": "What is in this image?"}]}]
+}'
+```
+
 ## Feature flags
 
 Set in the environment of `scripts/serve.sh` (`scripts/duo.sh` sets them per layout).

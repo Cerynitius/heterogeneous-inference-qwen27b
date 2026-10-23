@@ -67,10 +67,16 @@ ap.add_argument("--compact-trigger", type=int, default=-1,
                      "Like the industry default the full 256K stays verbatim; near the end thinking room shrinks")
 ap.add_argument("--compact-keep", type=int, default=24000, help="recent tokens kept verbatim after a compaction")
 ap.add_argument("--compact-head", type=int, default=8192, help="the first user message stays verbatim up to this size")
+ap.add_argument("--img-max-pixels", type=int, default=4194304,
+                help="images above this many pixels are shrunk in the router (imgshrink.py); 0 = off")
+ap.add_argument("--img-workers", type=int, default=3, help="image shrink worker processes")
+ap.add_argument("--img-cache-mb", type=int, default=1024, help="cache of shrunk images (by input hash)")
 args = ap.parse_args()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
                     filename=args.log or None)
 log = logging.getLogger("adapd")
+from imgshrink import Shrinker
+SHRINK = Shrinker(args.img_max_pixels, args.img_workers, args.img_cache_mb << 20, 64 << 20, log)
 XFER_GBPS = 13.0          # NIXL push measured (96K in 0.26 s); only logged (info xfer_s)
 KV_BYTES_PER_TOKEN = 37000   # measured: FP8 KV + GDN/conv states + DFlash2 drafter KV, 5.6 GB / 153K tok
 
@@ -152,12 +158,25 @@ def chained_hashes(text):
     return out
 
 
+def estimate(body, text):
+    """Token estimate; image parts count as their model tokens, not as base64 characters."""
+    ic, it = SHRINK.measure(body)
+    return int((len(text) - ic) / cpt[0]) + it + 16
+
+
+def text_only(msgs):
+    return [dict(m, content=[p for p in m["content"] if not (isinstance(p, dict) and p.get("type") == "image_url")])
+            if isinstance(m.get("content"), list) else m for m in msgs]
+
+
 async def count_tokens(body, text):
-    if len(text) < args.tokenize_above:
-        return int(len(text) / cpt[0]) + 16
+    ic, it = SHRINK.measure(body)
+    chars = len(text) - ic
+    if chars < args.tokenize_above:
+        return int(chars / cpt[0]) + it + 16
     req = {"model": body.get("model")}
     if "messages" in body:
-        req.update(messages=body["messages"], add_generation_prompt=True)
+        req.update(messages=text_only(body["messages"]) if ic else body["messages"], add_generation_prompt=True)
         if body.get("tools"):
             req["tools"] = body["tools"]
     else:
@@ -165,11 +184,11 @@ async def count_tokens(body, text):
     try:
         async with session.post(B[0].url + "/tokenize", json=req, timeout=aiohttp.ClientTimeout(total=120)) as r:
             n = (await r.json())["count"]
-        cpt[0] = 0.8 * cpt[0] + 0.2 * (len(text) / max(n, 1))
-        return n
+        cpt[0] = 0.8 * cpt[0] + 0.2 * (chars / max(n, 1))
+        return n + it
     except Exception as e:
         log.info(f"tokenize failed ({type(e).__name__}: {e}); estimating")
-        return int(len(text) / cpt[0]) + 16
+        return int(chars / cpt[0]) + it + 16
 
 
 def session_key(body):
@@ -354,9 +373,10 @@ def msg_hash(msgs):
 
 
 def msg_tokens(m):
+    ic, it = SHRINK.measure({"messages": [m]})
     c = m.get("content")
     c = c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)
-    return int((len(c or "") + len(json.dumps(m.get("tool_calls") or "", ensure_ascii=False))) / cpt[0]) + 8
+    return int((len(c or "") - ic + len(json.dumps(m.get("tool_calls") or "", ensure_ascii=False))) / cpt[0]) + it + 8
 
 
 def compact_config(body):
@@ -557,6 +577,7 @@ async def handle_gen(request):
     t_in = time.time()
     body = await request.json()
     think = scrub_request(body, request.path)
+    await SHRINK.apply(body, session)
     rid = f"q{next(rid_counter)}"
     skey = session_key(body) if args.home or "messages" in body else None
     cinfo = ""
@@ -565,20 +586,20 @@ async def handle_gen(request):
         if trig:
             orig = list(body["messages"])        # the client's history: compactions are keyed on its prefixes
             _, off = apply_compaction(body, skey)
-            if int(len(serialize(body)) / cpt[0]) + 16 > trig:
+            if estimate(body, serialize(body)) > trig:
                 async with COMPACT_LOCKS.setdefault(skey, asyncio.Lock()):
                     body["messages"] = list(orig)          # another request of the session may have compacted meanwhile
                     _, off = apply_compaction(body, skey)
                     n0 = await count_tokens(body, serialize(body))
                     if n0 > trig:
                         msg = await compact(body, skey, n0, instr, orig, off)
-                        n1 = int(len(serialize(body)) / cpt[0]) + 16
+                        n1 = estimate(body, serialize(body))
                         cinfo = f"{n0}->{n1}" if msg.startswith("compacted") else ""
                         log.info(f"{rid} {msg} ({n0} -> ~{n1} tok)")
     text = serialize(body)
     hashes = chained_hashes(text)
     if skey and any(skey in b.sessions for b in B):   # homed: the count only updates its KV share, an estimate will do
-        n = int(len(text) / cpt[0]) + 16
+        n = estimate(body, text)
     else:
         n = await count_tokens(body, text)
     prov = provision(body, n, think)
@@ -656,6 +677,8 @@ async def on_startup(app):
 
 async def on_cleanup(app):
     await session.close()
+    if SHRINK.pool is not None:
+        SHRINK.pool.shutdown(wait=False, cancel_futures=True)
 
 
 app = web.Application(client_max_size=1 << 30)
