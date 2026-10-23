@@ -296,6 +296,7 @@ class Scheduler(SchedulerInterface):
                     else 1
                 )
             self.use_eagle_block_drop = speculative_config.use_eagle_block_drop()
+            qwen38_sched.LOOKAHEAD = self.num_prefill_lookahead   # hetero-qwen27b: encoder window
             if self.use_eagle and not self.use_eagle_block_drop:
                 logger.warning(
                     "EAGLE trailing prefix-cache block dropping is disabled. "
@@ -705,7 +706,7 @@ class Scheduler(SchedulerInterface):
             q38_start = request.num_computed_tokens
             q38_prefill = q38 is not None and qwen38_sched.prefill_left(request) > 0
             if q38_prefill:
-                num_new_tokens = q38.cap(q38_start, num_new_tokens, running=True)
+                num_new_tokens = q38.cap(q38_start, num_new_tokens, running=True, request=request)
             self._q38_split_cap = num_new_tokens if q38_prefill else 0
 
             # Apply Mamba alignment before encoder caps.
@@ -843,7 +844,7 @@ class Scheduler(SchedulerInterface):
             input_budget -= num_new_tokens + draft_slots
             req_index += 1
             if q38_prefill:
-                q38.charge(q38_start, num_new_tokens, running=True)
+                q38.charge(q38_start, num_new_tokens, running=True, request=request)
 
             # Speculative decode related.
             if request.spec_token_ids:
@@ -1122,7 +1123,7 @@ class Scheduler(SchedulerInterface):
                     )
                     if q38_prefill:
                         num_new_tokens = q38.cap(
-                            num_computed_tokens, num_new_tokens, running=False
+                            num_computed_tokens, num_new_tokens, running=False, request=request
                         )
                     self._q38_split_cap = num_new_tokens if q38_prefill else 0
 
@@ -1310,7 +1311,7 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
                 if q38_prefill:
-                    q38.charge(num_computed_tokens, num_new_tokens, running=False)
+                    q38.charge(num_computed_tokens, num_new_tokens, running=False, request=request)
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:

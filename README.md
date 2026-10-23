@@ -144,6 +144,7 @@ Set in the environment of `scripts/serve.sh` (`scripts/duo.sh` sets them per lay
 | flag | |
 |---|---|
 | `QWEN38_SCHED=1` | latency-aware prefill scheduler (`QWEN38_SCHED_*` tunables: `vllm/v1/core/sched/qwen38_sched.py`) |
+| `QWEN38_SCHED_ELIN_NS`, `QWEN38_SCHED_EATT_PS` | vision-encoder cost per image patch (linear, quadratic) for the scheduler |
 | `QWEN38_FP8ATTN=1` | FP8 prefill attention kernel (needs `B12XPF=1`) |
 | `QWEN38_FP8DEC=1` | FP8 spec-verify decode attention |
 | `QWEN38_GDN_DEFER=1` | deferred GDN state writes for speculative decoding |

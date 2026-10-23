@@ -28,6 +28,15 @@ T_SOLO = float(os.environ.get("QWEN38_SCHED_TSOLO_MS", "500")) / 1e3 or math.inf
 C_LIN = float(os.environ.get("QWEN38_SCHED_CLIN_US", "77.8")) / 1e6
 C_ATT = float(os.environ.get("QWEN38_SCHED_CATT_NS", "1.425")) / 1e9
 MIN_CHUNK = int(os.environ.get("QWEN38_SCHED_MIN_CHUNK", "64"))
+# ENC (image input): the vision encoder runs inside the step whose chunk first reaches an image's placeholder
+# tokens, and its time is not in cost() (a 16.7 MP image held every decode ~3 s on the PRO 6000). Per image of p patches
+# (= 4 x its embedding tokens, spatial merge 2x2): enc = p * (E_LIN + E_ATT * p); the vision attention is per frame, so for
+# video the quadratic term uses min(p, ENC_FRAME). Charged with the chunk, deducted from the step's time before the chunk
+# is sized, and an image that no longer fits ends the chunk just before it (it is encoded in the next step). 0 = off.
+E_LIN = float(os.environ.get("QWEN38_SCHED_ELIN_NS", "0")) / 1e9
+E_ATT = float(os.environ.get("QWEN38_SCHED_EATT_PS", "0")) / 1e12
+ENC_FRAME = int(os.environ.get("QWEN38_SCHED_ENC_FRAME", "16384"))
+LOOKAHEAD = 0   # set by the scheduler: vLLM encodes images up to num_prefill_lookahead tokens past the chunk end
 # RESERVE: tokens of the step budget kept for a waiting request. 0 (default) = a quarter of the budget: the
 # fixed 8192 dated from max_num_batched_tokens 32768 and with MNBT 8192 left running prefills 0 tokens (and half the
 # step's time unused) on every step that admitted a request.
@@ -144,6 +153,26 @@ def tokens_for(start: int, t: float) -> int:
     return int((math.sqrt(b * b + 2 * C_ATT * t) - b) / C_ATT)
 
 
+def _enc_item(f) -> float:
+    try:
+        p = 4 * f.mm_position.get_num_embeds()
+    except Exception:
+        p = 4 * f.mm_position.length
+    q = min(p, ENC_FRAME) if f.modality == "video" else p
+    return p * (E_LIN + E_ATT * q)
+
+
+def enc_items(request, start: int, end: int) -> list:
+    """(offset, encoder seconds) of the images whose placeholders start in [start, end): encoded in that chunk."""
+    if not (E_LIN or E_ATT) or request is None or not getattr(request, "mm_features", None):
+        return []
+    return [(f.mm_position.offset, _enc_item(f)) for f in request.mm_features if start <= f.mm_position.offset < end]
+
+
+def enc_left(request) -> float:
+    return sum(c for _, c in enc_items(request, request.num_computed_tokens, 1 << 62))
+
+
 def prefill_left(request) -> int:
     """Prompt (or recompute) tokens still to prefill; 0 for a decoding request."""
     if request.num_output_placeholders:
@@ -156,7 +185,7 @@ def order_running(running: list) -> None:
     """In place: decodes first (stable), then prefills by least remaining prefill time."""
     def key(r):
         left = prefill_left(r)
-        return (1, cost(r.num_computed_tokens, left)) if left else (0, 0.0)
+        return (1, cost(r.num_computed_tokens, left) + enc_left(r)) if left else (0, 0.0)
     running.sort(key=key)
 
 
@@ -164,7 +193,7 @@ class StepPlan:
     def __init__(self, running: list, waiting_ready: bool, token_budget: int, urgent: bool = False):
         self.decoding = any(not prefill_left(r) for r in running)
         self.time_left = T_ADD if self.decoding else T_SOLO
-        backlog = sum(cost(r.num_computed_tokens, prefill_left(r)) for r in running if prefill_left(r))
+        backlog = sum(cost(r.num_computed_tokens, prefill_left(r)) + enc_left(r) for r in running if prefill_left(r))
         self.carried_prefill = False
         self.hold = decode_starved(self.decoding, backlog) | over_prefill_share(self.decoding, backlog)   # decode-only step
         global _last_plan
@@ -183,27 +212,50 @@ class StepPlan:
         self.running_time = self.time_left * (1 - RESERVE_FRAC) if waiting_ready else self.time_left
         self.running_prefilled = False
 
-    def cap(self, start: int, n: int, running: bool) -> int:
+    def cap(self, start: int, n: int, running: bool, request=None) -> int:
         """Clip a prefill chunk of n tokens that starts at position `start`."""
         if self.hold:
             return 0
+        t = min(self.time_left, self.running_time) if running else self.time_left
+        first = not self.running_prefilled if running else True
         if running:
             n = min(n, self.running_tokens)
-            m = tokens_for(start, min(self.time_left, self.running_time))
-            if not self.running_prefilled:
-                m = max(m, MIN_CHUNK)
-        else:
-            m = max(tokens_for(start, self.time_left), MIN_CHUNK)
+        m = tokens_for(start, t)
+        items = sorted(enc_items(request, start, start + min(n, max(m, MIN_CHUNK if first else 0)) + LOOKAHEAD))
+        if items:
+            # images in the chunk: their encoder time comes out of the step's time first. An image that does not fit
+            # ends the chunk just before its placeholder; one at the chunk's first token runs only in a step's first
+            # chunk (it has to run sometime, and a fresh step is the cheapest place).
+            spent, last = 0.0, None
+            for off, c in items:
+                if cost(start, off - start) + spent + c > t:
+                    if off - LOOKAHEAD > start:
+                        m = off - start - LOOKAHEAD
+                        break
+                    if not first:
+                        return 0
+                spent += c
+                last = off
+            else:
+                m = max(tokens_for(start, max(t - spent, 0.0)), last - start - LOOKAHEAD + 1)
+                if first:
+                    m = max(m, MIN_CHUNK)
+                n = min(n, m)
+                if ALIGN and m >= ALIGN and start + m - m % ALIGN + LOOKAHEAD > last:
+                    m -= m % ALIGN
+                return max(min(n, m), 0)
+        elif first:
+            m = max(m, MIN_CHUNK)
         if ALIGN and m < n and m >= ALIGN:
             m -= m % ALIGN
         return max(min(n, m), 0)
 
-    def charge(self, start: int, n: int, running: bool) -> None:
+    def charge(self, start: int, n: int, running: bool, request=None) -> None:
         if n > 0:
             self.carried_prefill = True
             if self.log is not None:
                 self.log["pf"].append([start, n])
-        c = cost(start, n)
+        c = cost(start, n) + sum(e for _, e in enc_items(request, start, start + n + LOOKAHEAD))
         self.time_left -= c
         if running:
             self.running_prefilled = True
