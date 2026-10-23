@@ -1,0 +1,6 @@
+.venv/
+third_party/
+logs/
+vocab/
+__pycache__/
+*.pyc

@@ -1,0 +1,6 @@
+heterogeneous-inference-qwen27b
+Copyright 2026 Cerynitius
+
+The files under vllm/ are modified copies of files from vLLM 0.30.0
+(https://github.com/vllm-project/vllm), Copyright the vLLM authors,
+licensed under the Apache License, Version 2.0.
