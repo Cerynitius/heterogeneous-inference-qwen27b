@@ -36,6 +36,8 @@ MIN_CHUNK = int(os.environ.get("QWEN38_SCHED_MIN_CHUNK", "64"))
 E_LIN = float(os.environ.get("QWEN38_SCHED_ELIN_NS", "0")) / 1e9
 E_ATT = float(os.environ.get("QWEN38_SCHED_EATT_PS", "0")) / 1e12
 ENC_FRAME = int(os.environ.get("QWEN38_SCHED_ENC_FRAME", "16384"))
+IMG_FIRST = os.environ.get("QWEN38_SCHED_IMG_FIRST", "1") == "1"   # 0 = images neither ordered first nor held back
+IMG_SOON = int(os.environ.get("QWEN38_SCHED_IMG_SOON", "8192"))
 LOOKAHEAD = 0   # set by the scheduler: vLLM encodes images up to num_prefill_lookahead tokens past the chunk end
 # RESERVE: tokens of the step budget kept for a waiting request. 0 (default) = a quarter of the budget: the
 # fixed 8192 dated from max_num_batched_tokens 32768 and with MNBT 8192 left running prefills 0 tokens (and half the
@@ -181,11 +183,20 @@ def prefill_left(request) -> int:
     return left if left > 1 else 0
 
 
+def image_soon(request) -> bool:
+    """An image placeholder within the next IMG_SOON prompt tokens: its prefill goes before text-only prefills."""
+    c = request.num_computed_tokens
+    return bool(enc_items(request, c, c + IMG_SOON))
+
+
 def order_running(running: list) -> None:
-    """In place: decodes first (stable), then prefills by least remaining prefill time."""
+    """In place: decodes first (stable), then prefills whose next chunk encodes an image (text prefill makes way for
+    images), then the rest, each by least remaining prefill time."""
     def key(r):
         left = prefill_left(r)
-        return (1, cost(r.num_computed_tokens, left) + enc_left(r)) if left else (0, 0.0)
+        if not left:
+            return (0, 0, 0.0)
+        return (1, 0 if IMG_FIRST and image_soon(r) else 1, cost(r.num_computed_tokens, left) + enc_left(r))
     running.sort(key=key)
 
 
@@ -218,27 +229,29 @@ class StepPlan:
             return 0
         t = min(self.time_left, self.running_time) if running else self.time_left
         first = not self.running_prefilled if running else True
+        img_first = not self.carried_prefill if IMG_FIRST else first   # nothing prefilled in this step yet
         if running:
             n = min(n, self.running_tokens)
         m = tokens_for(start, t)
         items = sorted(enc_items(request, start, start + min(n, max(m, MIN_CHUNK if first else 0)) + LOOKAHEAD))
         if items:
-            # images in the chunk: their encoder time comes out of the step's time first. An image that does not fit
-            # ends the chunk just before its placeholder; one at the chunk's first token runs only in a step's first
-            # chunk (it has to run sometime, and a fresh step is the cheapest place).
+            # images in the chunk: their encoder time comes out of the step's time first, so decodes never wait longer
+            # than for a text-only step. An image that does not fit ends the chunk just before its placeholder; one at
+            # the chunk's first token runs only as the step's first prefill (it has to run sometime; image prefills are
+            # ordered first, and a waiting request gets RESERVE_FRAC of the next step, so a shrunk image fits there).
             spent, last = 0.0, None
             for off, c in items:
                 if cost(start, off - start) + spent + c > t:
                     if off - LOOKAHEAD > start:
                         m = off - start - LOOKAHEAD
                         break
-                    if not first:
+                    if not img_first:
                         return 0
                 spent += c
                 last = off
             else:
                 m = max(tokens_for(start, max(t - spent, 0.0)), last - start - LOOKAHEAD + 1)
-                if first:
+                if img_first:
                     m = max(m, MIN_CHUNK)
                 n = min(n, m)
                 if ALIGN and m >= ALIGN and start + m - m % ALIGN + LOOKAHEAD > last:
