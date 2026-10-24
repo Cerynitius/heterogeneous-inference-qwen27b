@@ -3,7 +3,7 @@
 #   MODEL         checkpoint dir (required)                       PORT      (8000)
 #   KVGIB         KV cache size in GiB (31.5)                     MAXSEQS   max concurrent sequences (6)
 #   MNBT          max batched tokens per step (32768)             BLOCK     attention block size (vLLM default)
-#   SPEC          draft tokens, 0 = no speculative decoding (0)
+#   SPEC          draft tokens, 0 = no speculative decoding (0; with DRAFTER=dflash2, 0 means 7)
 #   DRAFTER       mtp | dflash2 (mtp)                             DRAFTER_MODEL  DFlash2 drafter dir (dflash2 only)
 #   DRAFT_VOCAB   pruned draft vocabulary .pt (MTP only)          DRAFT_SAMPLE   probabilistic = sampled drafts (dflash2)
 #   PREFIX        1 = prefix caching (1)                          PMU       --prefix-match-unit
@@ -15,6 +15,7 @@
 #   COMPILE_CACHE 1 = keep the torch.compile cache                PROF      torch profiler output dir
 #   THINK_END     text forced at the thinking budget ("" = off)
 #   VLLM          vllm executable (vllm on PATH)                  QWEN38_*  passed through to the patched vLLM
+#   HOST          listen address (0.0.0.0)                        QWEN27B_KERNELS  kernels dir (./kernels)
 set -u
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 : "${MODEL:?MODEL=<checkpoint dir> is required}"

@@ -98,6 +98,7 @@ GPU0=0 GPU1=1 scripts/duo.sh home    # two replicas, sessions homed per card, MT
 | `KV0`, `KV1` | 66, 42 | KV cache GiB per card |
 | `SEQS0`, `SEQS1` | 10, 10 | max sequences per card |
 | `PORT0`, `PORT1`, `ROUTER_PORT` | 8000, 8001, 8090 | |
+| `ROUTER_HOST` | 0.0.0.0 | router listen address |
 | `CPUS0`, `CPUS1`, `CPUSR` | unset | `taskset` core lists for the servers / router |
 | `CF0`, `CF1` | per layout | scheduler cost constants `"us_per_token ns_per_token_ctx"` |
 | `ROUTER_ARGS` | | extra `router/adapd.py` arguments |
@@ -124,7 +125,9 @@ curl -s localhost:8090/v1/chat/completions -H 'Content-Type: application/json' -
 }'
 ```
 
-`reasoning_effort`: `low`, `medium`, `high`, `xhigh`, `max` (thinking budget per tier: `router/adapd.py --think-caps`).
+`reasoning_effort`: `low`, `medium` (default when unset: `--default-effort`), `high`, `xhigh`, `max` (thinking budget per
+tier: `router/adapd.py --think-caps`). A session is the caller (`X-Session-Id` or `Authorization` header) plus its first
+user message; send `X-Session-Id` when several agents start with the same prompt so they are placed independently.
 
 Images and video: OpenAI content parts (`image_url`, `video_url`; data URLs or http(s) links). The router shrinks images above 4,194,304 pixels before forwarding (`ROUTER_ARGS="--img-max-pixels N"`, `0` = off).
 
@@ -139,7 +142,8 @@ curl -s localhost:8090/v1/chat/completions -H 'Content-Type: application/json' -
 
 ## Feature flags
 
-Set in the environment of `scripts/serve.sh` (`scripts/duo.sh` sets them per layout).
+Set in the environment of `scripts/serve.sh`. `scripts/duo.sh` fixes them per layout (its `COMMON` / `LAY` arrays
+override the caller's environment; edit those to change a flag under duo.sh).
 
 | flag | |
 |---|---|
@@ -168,7 +172,7 @@ python tools/vocab_select.py vocab/gen_w0.jsonl --tokenizer <tokenizer.json> --w
 
 ```
 vllm/       modified vLLM 0.30.0 files (installed over the vLLM package)
-kernels/    fp8attn, fp4_gemv, gdn_defer, decode_fuse (JIT-built on first use)
+kernels/    fp8attn, fp4_gemv, gdn_defer (C++/CUDA, JIT-built when vLLM imports them), decode_fuse (Triton)
 router/     adapd.py — session homing + adaptive P/D router
 scripts/    serve.sh (one server), duo.sh (two cards + router)
 tools/      drafter W4A16 builders, draft vocabulary tools

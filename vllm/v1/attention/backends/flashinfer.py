@@ -104,7 +104,7 @@ logger = init_logger(__name__)
 trtllm_workspace_buffer = None
 
 # hetero-qwen27b QWEN38_B12X_PREFILL=1: run the prefill (extend) rows through b12x's paged extend kernel
-# (b12x 1.3.0, the version vLLM 0.30 pins; PYTHONPATH) instead of FlashInfer FA2. Same paged FP8 cache (HND, K|V
+# (b12x 1.3.0, the version vLLM 0.30's b12x extra pins; PYTHONPATH) instead of FlashInfer FA2. Same paged FP8 cache (HND, K|V
 # packed in the last dim, read through strided [pages, page, kv_heads, D] views), same causal softmax attention;
 # on sm120 with head_dim 256 it is ~20 % faster (FA2: 1 CTA = 4 warps/SM, FP8 repack not hidden). Not bitwise equal
 # (<= 1 bf16 ulp). Decode / spec-verify rows stay on the trtllm xqa kernel (b12x verify is slower there).
@@ -229,7 +229,7 @@ def _qwen38_kv_pages(impl, kv_perm, bt):
         k = kv_perm[..., :D].permute(0, pdim, hdim, 3)
         v = kv_perm[..., D:].permute(0, pdim, hdim, 3)
     else:
-        # hybrid models: one 1600-token page per block. View the same memory as 64-token pages with a uniform
+        # hybrid models: one page per block (1600 tokens as vLLM picks it here, BLOCK overrides). View the same memory as 64-token pages with a uniform
         # page stride (block b chunk j -> page b*mult + j) and expand the page table accordingly.
         page = 64
         if bs % page:
@@ -786,7 +786,8 @@ class FIPrefill:
     """Metadata for the native FlashInfer prefill pathway (non-TRTLLM)."""
 
     wrapper: BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper
-    # QWEN38_B12X_PREFILL=1: (block_table, seq_lens, cu_seqlens_q, num_reqs, num_tokens) of the prefill rows
+    # QWEN38_B12X_PREFILL=1: (block_table, seq_lens, cu_seqlens_q, num_reqs, num_tokens,
+    # max_seq_len) of the prefill rows
     b12x: tuple | None = None
 
 

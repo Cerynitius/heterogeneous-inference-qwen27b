@@ -19,7 +19,8 @@ matched pushes whose P→D handshake has finished so the writer can
 Wake model: the writer self-polls every
 ``_PUSH_WRITER_POLL_INTERVAL_MS`` only while it has unmatched
 ``_push_finished_blocks`` (i.e. P-side blocks waiting for a D PUSH_REG
-notif that has no other wake source). All other progress is
+notif that has no other wake source) or a D-side registration still
+pending in ``_recving_metadata`` (hetero-qwen27b). All other progress is
 event-driven: the engine main thread sets ``_push_writer_wake`` from
 ``start_load_kv`` (when handing it new work) and from ``get_finished``
 (so each engine step gives the writer a chance to drain NIXL notifs);

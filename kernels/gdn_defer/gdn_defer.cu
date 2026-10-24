@@ -1,5 +1,5 @@
 // GDN MTP decode with deferred state stores (hetero-qwen27b). Derived from vLLM v0.30.0
-// csrc/libtorch_stable/gdn/fused_gdn_decode_kernel.cu (Apache-2.0, copy kept next to this file).
+// csrc/libtorch_stable/gdn/fused_gdn_decode_kernel.cu (Apache-2.0).
 //
 // Stock: every spec-decode step stores the fp32 recurrent state after EVERY token (k+1 slots x 3 MiB per sequence per
 // layer for Qwen3.8-27B), only to read back slot[accepted-1] next step. Profile: the stores land as DRAM write
@@ -12,7 +12,7 @@
 //                   mamba postprocess): reloads the source state, replays the accepted tokens with the same per-token
 //                   update code, and stores slot[accepted-1] (and slot[bias] when the align-mode postprocess will copy
 //                   a block-boundary state). Those are the only slots anything reads afterwards.
-// kDefer=false compiles the stock kernel unchanged (reference for the unit test).
+// kDefer=false compiles the stock kernel unchanged (the bit-exact reference for kDefer=true).
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>

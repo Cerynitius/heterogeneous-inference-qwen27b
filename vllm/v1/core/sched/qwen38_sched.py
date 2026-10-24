@@ -12,7 +12,8 @@
 #   3. while a request waits with a free seat, running prefills leave RESERVE tokens and RESERVE_FRAC of T_ADD to it,
 #      so it is admitted in the same step and SRPT takes over from the next one;
 #   4. progress: the first running prefill and every admitted request get at least MIN_CHUNK tokens.
-# Chunk sizes below the Mamba block (1600 tokens) are passed to the align-mode split as its chunk limit, which then
+# Chunk sizes below the Mamba block (= the attention block size: 1600 tokens as vLLM picks it for this model, 1664 with
+# BLOCK=1664 as scripts/duo.sh sets) are passed to the align-mode split as its chunk limit, which then
 # advances sub-block and re-aligns at the next block boundary (stock behaviour for blocks wider than a chunk).
 # Off (default) = stock scheduling.
 import collections
@@ -23,8 +24,8 @@ import time
 ON = os.environ.get("QWEN38_SCHED", "0") == "1"
 T_ADD = float(os.environ.get("QWEN38_SCHED_TADD_MS", "40")) / 1e3
 T_SOLO = float(os.environ.get("QWEN38_SCHED_TSOLO_MS", "500")) / 1e3 or math.inf  # 0 = full token budget
-# cost(start, n) = n * (C_LIN + C_ATT * (start + n/2)) seconds; defaults = PRO 6000 refit
-# (32K 5.0 s, 128K 35.1 s, 256K 111.0 s; PRO 5000: 127 us / 3.06 ns from 5.8 / 43.1 / 138.5 s).
+# cost(start, n) = n * (C_LIN + C_ATT * (start + n/2)) seconds. Defaults = the PRO 6000 fit of the home layout
+# (32K 3.3 s, 128K 22.4 s, 256K 69.4 s); scripts/duo.sh passes per-card constants (CF0 / CF1) for each layout.
 C_LIN = float(os.environ.get("QWEN38_SCHED_CLIN_US", "77.8")) / 1e6
 C_ATT = float(os.environ.get("QWEN38_SCHED_CATT_NS", "1.425")) / 1e9
 MIN_CHUNK = int(os.environ.get("QWEN38_SCHED_MIN_CHUNK", "64"))
@@ -36,7 +37,8 @@ MIN_CHUNK = int(os.environ.get("QWEN38_SCHED_MIN_CHUNK", "64"))
 E_LIN = float(os.environ.get("QWEN38_SCHED_ELIN_NS", "0")) / 1e9
 E_ATT = float(os.environ.get("QWEN38_SCHED_EATT_PS", "0")) / 1e12
 ENC_FRAME = int(os.environ.get("QWEN38_SCHED_ENC_FRAME", "16384"))
-IMG_FIRST = os.environ.get("QWEN38_SCHED_IMG_FIRST", "1") == "1"   # 0 = images neither ordered first nor held back
+IMG_FIRST = os.environ.get("QWEN38_SCHED_IMG_FIRST", "1") == "1"   # 0 = images not ordered first; an image that does not
+# fit at a chunk start then runs only as the step's first running prefill (1: whenever nothing was prefilled yet)
 IMG_SOON = int(os.environ.get("QWEN38_SCHED_IMG_SOON", "8192"))
 LOOKAHEAD = 0   # set by the scheduler: vLLM encodes images up to num_prefill_lookahead tokens past the chunk end
 # RESERVE: tokens of the step budget kept for a waiting request. 0 (default) = a quarter of the budget: the
@@ -51,7 +53,7 @@ RESERVE_FRAC = float(os.environ.get("QWEN38_SCHED_RESERVE_FRAC", "0.5"))
 T_URGENT = float(os.environ.get("QWEN38_SCHED_TURGENT_MS", "0")) / 1e3   # 0 = off
 # ALIGN: a prefill chunk that the time cap cut short is rounded down to a multiple of ALIGN tokens. b12x paged
 # extend cost per query token is a 1024-row sawtooth (jumps right after k*1024 rows, lowest just below; 32K/128K/230K
-# context alike, kernels/attn_cublas/b12x_nsweep.py) and the b12x FP4 GEMM changes tactic above M=1024, so the
+# context alike, measured with a b12x N sweep) and the b12x FP4 GEMM changes tactic above M=1024, so the
 # ~1100-token chunks a 300 ms cap produced ran ~20 % slower per token. 832 = half a 1664-token Mamba block: no
 # remainder chunks at block boundaries. 0 = off.
 ALIGN = int(os.environ.get("QWEN38_SCHED_ALIGN", "0"))
@@ -72,7 +74,7 @@ _step_starts: collections.deque = collections.deque()
 # of prefill work left in the running set, by cost()):  f(x) = S0 + (SINF - S0) * x^G / (x^G + K^G).  Shortest-work-first
 # logic: a small backlog (a turn's few K new tokens) is cheap to finish, so it may take nearly all of the step time
 # (S0 ~ 1); a large cold backlog would hold every decode for minutes, so its share falls towards SINF. A step over the
-# cap carries no prefill. Values from sched/sim/train_curve.py. 0 = off.
+# cap carries no prefill. Values fitted in a scheduler simulation of agent and cold-burst traffic. 0 = off.
 PF_CURVE = os.environ.get("QWEN38_SCHED_PF_CURVE", "0") == "1"
 PF_S0 = float(os.environ.get("QWEN38_SCHED_PF_S0", "1.0"))
 PF_SINF = float(os.environ.get("QWEN38_SCHED_PF_SINF", "0.7"))
@@ -190,8 +192,8 @@ def image_soon(request) -> bool:
 
 
 def order_running(running: list) -> None:
-    """In place: decodes first (stable), then prefills whose next chunk encodes an image (text prefill makes way for
-    images), then the rest, each by least remaining prefill time."""
+    """In place: decodes first (stable), then prefills with an image placeholder within the next IMG_SOON prompt tokens
+    (text prefill makes way for images; IMG_FIRST=1), then the rest, each by least remaining prefill time."""
     def key(r):
         left = prefill_left(r)
         if not left:

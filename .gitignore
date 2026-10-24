@@ -4,3 +4,4 @@ logs/
 vocab/
 __pycache__/
 *.pyc
+kernels/*/build*/

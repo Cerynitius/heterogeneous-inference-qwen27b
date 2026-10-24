@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Adaptive prefill/decode router for the two-card Qwen3.8-27B setup.
 
-Both vLLM servers run NixlConnector as kv_both, so each request can go one of two ways:
+In the apd layout both vLLM servers run NixlPushConnector as kv_both, so each request can go one of two ways (the
+home layout runs no connector: always aggregated):
   * aggregated: prefill and decode on one card (any request; no KV transfer);
-  * split: prefill on card P (kv_transfer_params do_remote_decode, max_tokens 1), then decode on card D, which pulls
-    the KV (and GDN state) over NIXL; D reuses whatever prefix it already has cached and pulls only the rest.
-Per request the router predicts prefill time on each card with the scheduler's cost model (sched/qwen38_sched.py,
+  * split: prefill on card P (kv_transfer_params do_remote_decode, max_tokens 1), then decode on card D: P pushes
+    the KV (and GDN state) over NIXL; D reuses whatever prefix it already has cached and P writes only the rest.
+Per request the router predicts prefill time on each card with the scheduler's cost model (vllm/v1/core/sched/qwen38_sched.py,
 per-card constants), minus the prefix the card is believed to hold:
   * short (best predicted prefill <= --short-s): aggregated on the card with the best score = predicted prefill +
     penalty if the card is running a long prefill (its decodes are throttled to T_ADD) + small load term. A large
@@ -19,8 +20,8 @@ LRU-capped by the card's KV token capacity): approximate, like vllm-router's cac
 --home-split: as --home, but a session's first prefill may run on the other card and reach its home over NIXL.
 --home (agent sessions): a session (= its first user message) lives on one card. Its first request picks the card
 that fits it (KV of the sessions already living there + this prompt <= --kv-fill of the card's KV tokens, seats free)
-with the lowest decode attention load per step afterwards, sum(session tokens) * C_ATT; ties -> earliest prefill
-finish. Later requests of the session stay on that card (aggregated), so its history never has to be re-prefilled.
+with the fewest sessions weighted by the card's speed, (sessions + 1) * C_LIN, then the lowest decode attention load
+per step afterwards, sum(session tokens) * C_ATT; ties -> earliest prefill finish. Later requests of the session stay on that card (aggregated), so its history never has to be re-prefilled.
 Sessions idle for --session-ttl s (default 300) stop counting.
 
   adapd.py --port 8090 --backend w6=http://127.0.0.1:8000,114,2.36,6,1382480 \
@@ -59,8 +60,11 @@ ap.add_argument("--ctx", type=int, default=262144, help="max_model_len of the se
 ap.add_argument("--think-caps", default="low=49152,medium=65536,high=98304,xhigh=131072,max=0",
                 help="hard thinking budget per effort tier (0 = whatever the context leaves after the answer room); "
                      "a safety net only, never hit naturally: >= 2x the longest uncapped thinking measured per "
-                     "template level (low 23.7K, medium 15.4K, xhigh 39.1K; p2p/think_tiers.py --parts natural)")
+                     "template level (low 23.7K, medium 15.4K, xhigh 39.1K)")
 ap.add_argument("--answer-min", type=int, default=16384, help="visible-answer room thinking can never take")
+ap.add_argument("--default-effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"],
+                help="tier for requests that set none (medium: on a 2K-item verifiable prompt pool it answered as accurately "
+                     "as xhigh with ~40 %% fewer generated tokens)")
 ap.add_argument("--compact-trigger", type=int, default=-1,
                 help="compact a chat session once its prompt passes this many tokens; -1 (default) = "
                      "only when it no longer fits: prompt > ctx - --answer-min (would be a 400 / no answer room), 0 = off. "
@@ -191,18 +195,20 @@ async def count_tokens(body, text):
         return int(chars / cpt[0]) + it + 16
 
 
-def session_key(body):
+def session_key(body, ident=""):
+    """Session = caller identity (X-Session-Id / Authorization: identical first messages from different callers are
+    different sessions) + first user turn."""
     for m in body.get("messages", []):
         if m.get("role") == "user":
             c = m.get("content")
             c = c if isinstance(c, str) else json.dumps(c, sort_keys=True)
-            return hashlib.blake2b(f"{len(c)}\x00{c[:8192]}".encode("utf-8", "surrogatepass"), digest_size=12).hexdigest()
+            return hashlib.blake2b(f"{ident}\x00{len(c)}\x00{c[:8192]}".encode("utf-8", "surrogatepass"), digest_size=12).hexdigest()
     # raw /v1/completions prompt: the first user turn of the chat-templated text keys the session
     p = body.get("prompt")
     if isinstance(p, str):
         i = p.find("<|im_start|>user")
         if i >= 0:
-            return hashlib.blake2b(("raw\x00" + p[i:i + 8192]).encode("utf-8", "surrogatepass"), digest_size=12).hexdigest()
+            return hashlib.blake2b((f"raw\x00{ident}\x00" + p[i:i + 8192]).encode("utf-8", "surrogatepass"), digest_size=12).hexdigest()
     return None
 
 
@@ -220,9 +226,13 @@ def decide_home(n, hashes, skey):
         hit = info["hit"][b.name]
         fits = res + n <= args.kv_fill * b.kv_tokens and len(b.sessions) < b.max_seqs
         finish = b.long_prefill_left(now) + b.cost(hit, n - hit) / (args.tadd_share if b.decoding() else 1.0)
-        rows.append((not fits, (res + n) * b.c_att, finish, b))
-        info[b.name] = {"res": res, "fits": fits, "load_ms": round((res + n) * b.c_att * 1e3, 2), "finish": round(finish, 1)}
-    b = min(rows, key=lambda r: (r[0], round(r[1] * 1e3, 1), r[2]))[3]
+        # sessions first by count weighted by the card's speed (C_LIN), so small agent sessions spread over both cards
+        # (the rounded attention load alone ties at 0 and would send every session to the cache-holding card)
+        share = (len(b.sessions) + 1) * b.c_lin
+        rows.append((not fits, share, (res + n) * b.c_att, finish, b))
+        info[b.name] = {"res": res, "fits": fits, "sessions": len(b.sessions), "share": round(share * 1e6, 1),
+                        "load_ms": round((res + n) * b.c_att * 1e3, 2), "finish": round(finish, 1)}
+    b = min(rows, key=lambda r: (r[0], round(r[1] * 1e6, 1), round(r[2] * 1e3, 1), r[3]))[4]
     b.sessions[skey] = [n, now]
     if args.home_split:
         # The session's history will live on b (D). Its first prefill may run on the other card if that one finishes
@@ -276,7 +286,7 @@ THINK_RE = re.compile(r"<think>.*?</think>\s*", re.S)
 
 
 # Thinking provisioning, Claude API semantics on top of vLLM:
-#   effort tiers low / medium / high / xhigh (default) / max from output_config.effort, reasoning_effort or
+#   effort tiers low / medium (default, --default-effort) / high / xhigh / max from output_config.effort, reasoning_effort or
 #   chat_template_kwargs.reasoning_effort; thinking {type: adaptive | enabled + budget_tokens | disabled} (or vLLM's
 #   thinking_token_budget) sets an explicit budget. Each tier = the template's soft instruction + a hard cap
 #   (vLLM thinking_token_budget: at the cap the server forces the end-of-thinking string and the model answers).
@@ -305,9 +315,9 @@ def provision(body, n, think_raw):
     ctk = dict(body.get("chat_template_kwargs") or {})
     th = body.pop("thinking", None) or {}
     oc = body.pop("output_config", None) or {}
-    effort = oc.get("effort") or body.pop("reasoning_effort", None) or ctk.get("reasoning_effort") or "xhigh"
+    effort = oc.get("effort") or body.pop("reasoning_effort", None) or ctk.get("reasoning_effort") or args.default_effort
     if effort not in TIER_TEMPLATE:
-        effort = "xhigh"
+        effort = args.default_effort
     budget = body.pop("thinking_token_budget", None)
     if th.get("type") == "enabled" and th.get("budget_tokens") is not None:
         budget = int(th["budget_tokens"])
@@ -466,8 +476,8 @@ async def compact(body, skey, n, instr, orig, off):
 
 def effort_of(body, ctk):
     oc = body.get("output_config") or {}
-    e = oc.get("effort") or body.get("reasoning_effort") or ctk.get("reasoning_effort") or "xhigh"
-    return e if e in TIER_TEMPLATE else "xhigh"
+    e = oc.get("effort") or body.get("reasoning_effort") or ctk.get("reasoning_effort") or args.default_effort
+    return e if e in TIER_TEMPLATE else args.default_effort
 
 
 def scrub_request(body, path):
@@ -579,7 +589,8 @@ async def handle_gen(request):
     think = scrub_request(body, request.path)
     await SHRINK.apply(body, session)
     rid = f"q{next(rid_counter)}"
-    skey = session_key(body) if args.home or "messages" in body else None
+    ident = request.headers.get("X-Session-Id", "") + "\x01" + request.headers.get("Authorization", "")
+    skey = session_key(body, ident) if args.home or "messages" in body else None
     cinfo = ""
     if "messages" in body:
         trig, instr = compact_config(body)

@@ -4,9 +4,10 @@
 The drafter only changes the acceptance rate (the target verifies every draft exactly). bf16 DFlash2 reads 3.85 GB per
 draft pass (+3-4 ms/step on the PRO 5000 vs MTP); quantizing its 5 layers' o, gate/up, down and fc to
 W4A16_NVFP4 (Marlin) cuts that to ~1.1 GB. Conv kernels, the candidate selector (codebooks, hidden_projection) and
-norms stay bf16. Fused shards (q/k/v, gate/up) share one global scale (joint amax), as ModelOpt does.
-quantized_layers lists every linear under the local name (layers.i), the global vLLM name (model.layers.<64+i>) and
-layers.<64+i>, so the MIXED_PRECISION lookup matches whatever prefix the draft model is built with (vLLM #61003 is the
+norms stay bf16, and so do q/k/v (DFlash runs them as one fused bf16 GEMM for its context-KV precompute). The fused
+gate/up pair shares one global scale (joint amax), as ModelOpt does.
+quantized_layers lists every linear under the local name (layers.i), model.<local name>, the global vLLM name
+(model.layers.<64+i>) and layers.<64+i>, so the MIXED_PRECISION lookup matches whatever prefix the draft model is built with (vLLM #61003 is the
 same aliasing problem for FP8 exclusions).
   python tools/build_dflash2_w4a16.py <DFlash2 drafter dir>   # writes <dir>-w4a16
 """

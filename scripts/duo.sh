@@ -14,7 +14,9 @@
 #   CF0, CF1       scheduler cost constants "us_per_token ns_per_token_ctx"
 #                  (apd: "87.2 0.870", "103.0 1.123"; home: "77.8 1.425", "95.4 1.828")
 #   ROUTER_ARGS    extra router/adapd.py arguments          LOGDIR        (./logs)
-#   any other variable (QWEN38_*, B12X_DIR, VLLM, ...) is passed to scripts/serve.sh
+#   ROUTER_HOST    router listen address (0.0.0.0)
+#   any other variable (B12X_DIR, VLLM, ...) is passed to scripts/serve.sh; the per-layout settings in COMMON / LAY
+#   below (QWEN38_SCHED_*, SPEC, MNBT, BLOCK, NVFP4, ...) override the caller's environment
 set -u
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 LAYOUT=${1:-apd}

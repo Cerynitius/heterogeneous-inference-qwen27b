@@ -4,7 +4,8 @@ Wiring (hetero-qwen27b changes in vLLM 0.30, active with QWEN38_GDN_DEFER=1):
   GDNAttentionMetadataBuilder.__init__  -> init(...)          allocate (eager, before any graph capture)
   GDNAttentionMetadataBuilder.build     -> begin_step(mask, n) epoch += 1 on the device, spec row -> batch row map
   GDN layer spec decode (fused MTP path) -> decode(layer, ...) kernel A instead of the stock kernel
-  GPUModelRunner._update_states_after_model_execute, right after the accepted counts and before the mamba postprocess
+  GPUModelRunner._update_states_after_model_execute (V1 runner) and the mamba-hybrid model state of the V2 runner
+  (worker/gpu/model_states/mamba_hybrid.py), right after the accepted counts and before the mamba postprocess
                                         -> materialize(...)    kernel B
 All buffers have fixed addresses, so the forward can be a CUDA graph (kernel A reads the epoch from device memory).
 """

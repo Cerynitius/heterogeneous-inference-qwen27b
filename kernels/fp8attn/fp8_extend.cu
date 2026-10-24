@@ -6,7 +6,7 @@
 // Layout: q [nq, HQ, D] bf16; k / v cache [pages, PAGE=64, HK, D] e4m3 with arbitrary page / token / head strides
 // (bytes); page_table [width] int32 (one request); out [nq, HQ, D] bf16.
 // CTA = one KV head x 128 packed rows (row = token * 6 + head-in-group, ~21 tokens) x one KV split; 8 warps x 16
-// rows (2 warps per SM sub-partition: 6 warps left two tensor pipes half idle, 777 vs 1008 TF in kernels/fp8attn/mma_rate.cu).
+// rows (2 warps per SM sub-partition: 6 warps left two tensor pipes half idle, 777 vs 1008 TF in an MMA-rate microbenchmark).
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>

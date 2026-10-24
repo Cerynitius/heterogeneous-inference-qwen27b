@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Pick the pruned draft vocabulary from the model's own outputs.
 
-Ranking: tokens seen in vocab/gen_*.jsonl by count (desc), then the remaining ids in increasing id order (byte-level BPE:
-lower id = earlier merge = more frequent in the tokenizer corpus), special/added tokens always in.
+Ranking: a weighted mixture of normalized token frequencies, --w (default zh=0.3,en=0.2,code=0.15,gen=0.35): gen = the
+model's own outputs (the vocab_freq.py files), zh / en / code = the --corpus counts (corpus_freq.py); ties by id
+(byte-level BPE: lower id = earlier merge), special/added tokens always first.
 Report: held-out coverage (every 5th prompt held out, frequencies from the rest) for several N, for this ranking and for
 the plain id prefix [0, N). Writes vocab/draft_vocab_<N>.pt (sorted int64, frequencies from ALL prompts) for --write N.
-  vocab_select.py vocab/gen_w5_vocab.jsonl [--write 32768]
+  vocab_select.py vocab/gen_<tag>.jsonl --tokenizer <tokenizer.json> [--corpus vocab/corpus_counts.npz] [--write 32768]
 """
 import argparse, collections, json, torch
 
